@@ -8,9 +8,10 @@ import {
 import { CreateOrderDto } from './dto/create-order.dto';
 import { PrismaClient } from '@prisma/client';
 import { ClientProxy, RpcException } from '@nestjs/microservices';
-import { OrderPaginationDto, UpdateOrderDto } from './dto';
+import { OrderPaginationDto, PaidOrderDto, UpdateOrderDto } from './dto';
 import { NATS_SERVICE } from 'src/config';
 import { firstValueFrom } from 'rxjs';
+import { OrderWithProducts } from './interfaces';
 
 @Injectable()
 export class OrdersService extends PrismaClient implements OnModuleInit {
@@ -55,7 +56,7 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
         data: {
           totalAmount,
           totalItems,
-          orderItem: {
+          OrderItem: {
             createMany: {
               data: items.map((orderItem) => ({
                 productId: orderItem.productId,
@@ -68,7 +69,7 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
           },
         },
         include: {
-          orderItem: {
+          OrderItem: {
             select: {
               productId: true,
               quantity: true,
@@ -80,7 +81,7 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
 
       return {
         ...order,
-        orderItem: order.orderItem.map((item) => ({
+        orderItem: order.OrderItem.map((item) => ({
           ...item,
           name: products.find((product) => product.id === item.productId).name,
         })),
@@ -118,7 +119,7 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
     const order = await this.order.findUnique({
       where: { id },
       include: {
-        orderItem: {
+        OrderItem: {
           select: {
             productId: true,
             quantity: true,
@@ -135,28 +136,72 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
       });
     }
 
-    const productIds = order.orderItem.map((item) => item.productId);
+    const productIds = order.OrderItem.map((item) => item.productId);
     const products = await firstValueFrom(
       this.serviceClient.send({ cmd: 'validate-products' }, productIds),
     );
 
     return {
       ...order,
-      orderItem: order.orderItem.map((item) => ({
+      orderItem: order.OrderItem.map((item) => ({
         ...item,
         name: products.find((product) => product.id === item.productId).name,
       })),
     };
   }
 
-  changeOrderStatus(updateOrderDto: UpdateOrderDto) {
+  async changeOrderStatus(updateOrderDto: UpdateOrderDto) {
     const { id, status } = updateOrderDto;
-    return this.order
-      .update({
+    try {
+      return await this.order.update({
         where: { id },
         data: { status },
-      })
-      .catch((error) => this.handleError(error.code));
+      });
+    } catch (error) {
+      return this.handleError(error.code);
+    }
+  }
+
+  async createPaymentSession(order: OrderWithProducts) {
+    const paymentSession = await firstValueFrom(
+      this.serviceClient.send(
+        { cmd: 'create-payment-session' },
+        {
+          orderId: order.id,
+          currency: 'usd',
+          items: order.orderItem.map((item) => ({
+            name: item.name,
+            price: item.price,
+            quantity: item.quantity,
+          })),
+        },
+      ),
+    );
+
+    return paymentSession;
+  }
+
+  async orderPaymentSuccess(orderPaymentSuccess: PaidOrderDto) {
+    this.logger.log(`Order payment success: ${orderPaymentSuccess.orderId}`);
+
+    const orderUpdated = await this.order.update({
+      where: { id: orderPaymentSuccess.orderId },
+      data: {
+        status: 'PAID',
+        paid: true,
+        paidAt: new Date(),
+        stripeChargeId: orderPaymentSuccess.stripePaymentId,
+
+        // relation
+        OrderReceipt: {
+          create: {
+            receiptUrl: orderPaymentSuccess.receipUrl,
+          },
+        },
+      },
+    });
+
+    return orderUpdated;
   }
 
   private handleError(errorCode: string) {
